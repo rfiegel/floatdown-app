@@ -1,0 +1,372 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Float-Down Analyzer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 18px; background:#fbfdff; color:#111; }
+    .card { background:#fff; border:1px solid #e6e6e6; border-radius:12px; padding:14px; margin:12px 0; box-shadow:0 1px 4px rgba(0,0,0,0.03); }
+    h1 { margin: 0 0 10px; font-size: 20px; }
+    h2 { margin: 0 0 10px; font-size: 16px; }
+    label { display:block; margin-top:10px; font-weight:700; font-size:13px; }
+    input { width:100%; margin-top:6px; padding:8px 10px; border:1px solid #ccc; border-radius:8px; }
+    .row { display:grid; grid-template-columns: 1fr 1fr; gap:14px; }
+    .row3 { display:grid; grid-template-columns: 1fr 1fr 1fr; gap:14px; }
+    button { padding:10px 14px; border-radius:10px; border:1px solid #0b69ff; background:#0b69ff; color:#fff; cursor:pointer; }
+    button.ghost { background:#fff; color:#0b69ff; }
+    .small { font-size:12px; color:#555; margin-top:6px; }
+    .err { display:none; background:#fff1f2; border:1px solid #fecaca; color:#9f1239; padding:10px 12px; border-radius:10px; margin-top:12px; }
+    table { width:100%; border-collapse:collapse; margin-top:12px; font-size:13px; background:#fff; }
+    th, td { border:1px solid #eef0f2; padding:8px; vertical-align:top; }
+    th { background:#fbfbfb; }
+    pre { white-space:pre-wrap; background:#f7f9fc; border:1px solid #e6eef8; border-radius:10px; padding:12px; max-height:260px; overflow:auto; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:700; border:1px solid #e5e7eb; background:#f9fafb; }
+    .yes { background:#ecfdf5; border-color:#a7f3d0; color:#065f46; }
+    .no { background:#fff1f2; border-color:#fecaca; color:#9f1239; }
+    .good { background:#ecfdf5; }
+    .bad { background:#fff1f2; }
+    .best { outline:2px solid #0b69ff; outline-offset:-2px; }
+    .muted { color:#6b7280; font-size:12px; }
+    .nowrap { white-space:nowrap; }
+  </style>
+</head>
+<body>
+
+  <!-- This text renders even with JS OFF. If you don't see this, you are not opening the file you think you are. -->
+  <h1>Float-Down Analyzer (Local HTML)</h1>
+  <div class="small">If this page ever looks totally blank, you are opening the wrong file or it saved as .txt.</div>
+
+  <div id="app"></div>
+  <div id="errorBox" class="err"></div>
+
+<script>
+(() => {
+  const app = document.getElementById("app");
+  const errorBox = document.getElementById("errorBox");
+
+  const showError = (msg) => {
+    console.error(msg);
+    errorBox.style.display = "block";
+    errorBox.textContent = msg;
+  };
+
+  const round3 = (x) => Math.round(x * 1000) / 1000;
+  const round2 = (x) => Math.round(x * 100) / 100;
+  const fmtMoney = (x) => Number(x).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const pctToDollars = (loanAmount, pct) => loanAmount * (pct / 100);
+  const signedMoney = (delta) => (delta >= 0 ? "+$" : "-$") + fmtMoney(Math.abs(delta));
+
+  const monthlyPI = (loanAmount, annualRatePct, termYears) => {
+    if (!loanAmount || !annualRatePct || !termYears) return 0;
+    const r = annualRatePct / 100 / 12;
+    const n = termYears * 12;
+    if (r === 0) return loanAmount / n;
+    return (r * loanAmount) / (1 - Math.pow(1 + r, -n));
+  };
+
+  const netUpfront = (points$, credit$) => Math.max(0, points$) - Math.max(0, credit$);
+
+  const breakevenMonths = (extraUpfront$, monthlySavings$) => {
+    if (extraUpfront$ <= 0) return "Immediate";
+    if (monthlySavings$ <= 0) return "No break-even";
+    const m = extraUpfront$ / monthlySavings$;
+    return `${Math.ceil(m)} mo (~${round2(m/12)} yrs)`;
+  };
+
+  // Baseline points% and credit% -> net points; apply deltaPrice; split into new points or new credit
+  const applyPriceDeltaToPointsAndCredit = (b, deltaPrice) => {
+    const startPts = Math.max(0, b.orig_points);
+    const startCreditPct = Math.max(0, b.orig_credit_pct);
+
+    const netStartPts = startPts - startCreditPct;     // +cost, -credit
+    const netNewPts = netStartPts - deltaPrice;        // better price reduces net cost
+
+    let newPts = 0, newCreditPct = 0;
+    if (netNewPts >= 0) newPts = netNewPts;
+    else newCreditPct = Math.abs(netNewPts);
+
+    return {
+      origPts: startPts,
+      origPts$: pctToDollars(b.loan_amount, startPts),
+      origCreditPct: startCreditPct,
+      origCredit$: pctToDollars(b.loan_amount, startCreditPct),
+
+      newPts,
+      newPts$: pctToDollars(b.loan_amount, newPts),
+      newCreditPct,
+      newCredit$: pctToDollars(b.loan_amount, newCreditPct),
+    };
+  };
+
+  const evaluateOption = (b, label, rate, price) => {
+    const deltaPrice = price - b.orig_price;                 // in pts (e.g. 0.185)
+    const eligible = deltaPrice > 0;
+
+    const adj = applyPriceDeltaToPointsAndCredit(b, deltaPrice);
+
+    const baselineUpfront$ = netUpfront(adj.origPts$, adj.origCredit$);
+    const optionUpfront$ = netUpfront(adj.newPts$, adj.newCredit$);
+    const deltaUpfront$ = optionUpfront$ - baselineUpfront$; // what you asked for
+
+    const pi = monthlyPI(b.loan_amount, rate, b.term_years);
+    const pitia = pi + b.tax_mo + b.hazard_mo + b.mi_mo + b.hoa_mo;
+
+    return { label, rate, price, deltaPrice, eligible, adj, baselineUpfront$, optionUpfront$, deltaUpfront$, pi, pitia };
+  };
+
+  const classFromDelta = (delta) => (delta < -0.01 ? "good" : (delta > 0.01 ? "bad" : ""));
+
+  // Build UI (no external dependencies, no required IDs)
+  app.innerHTML = `
+    <div class="card">
+      <h2>Baseline</h2>
+      <div class="row">
+        <div>
+          <label>Original Rate (%)</label>
+          <input id="orig_rate" type="number" step="0.001" placeholder="6.490">
+          <label>Original Price</label>
+          <input id="orig_price" type="number" step="0.001" placeholder="99.468">
+          <label>Discount Points (%)</label>
+          <input id="orig_points" type="number" step="0.001" placeholder="0.157">
+          <label>Lender Credit (%)</label>
+          <input id="orig_credit_pct" type="number" step="0.001" placeholder="0.250">
+          <div class="small">Enter percent of loan amount. Example: 0.250 = 0.250% credit.</div>
+          <label>Loan Amount ($)</label>
+          <input id="loan_amount" type="number" step="1000" placeholder="933750">
+        </div>
+
+        <div>
+          <h2>PITIA (monthly)</h2>
+          <label>Loan Term (years)</label>
+          <input id="term_years" type="number" value="30">
+          <label>Monthly Property Tax ($)</label>
+          <input id="tax_mo" type="number" value="0">
+          <label>Monthly Hazard Insurance ($)</label>
+          <input id="hazard_mo" type="number" value="0">
+          <label>Monthly Mortgage Insurance (MI) ($)</label>
+          <input id="mi_mo" type="number" value="0">
+          <label>Monthly HOA ($)</label>
+          <input id="hoa_mo" type="number" value="0">
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>New Pricing (3 options)</h2>
+      <div class="row3">
+        <div>
+          <label>Option A (Current) Rate</label>
+          <input id="A_rate" type="number" step="0.001" placeholder="6.490">
+          <label>Option A Price</label>
+          <input id="A_price" type="number" step="0.001" placeholder="99.578">
+        </div>
+        <div>
+          <label>Option B (Lower #1) Rate</label>
+          <input id="B_rate" type="number" step="0.001" placeholder="6.375">
+          <label>Option B Price</label>
+          <input id="B_price" type="number" step="0.001" placeholder="99.412">
+        </div>
+        <div>
+          <label>Option C (Lower #2) Rate</label>
+          <input id="C_rate" type="number" step="0.001" placeholder="6.250">
+          <label>Option C Price</label>
+          <input id="C_price" type="number" step="0.001" placeholder="99.300">
+        </div>
+      </div>
+
+      <div style="margin-top:12px; display:flex; gap:10px; flex-wrap:wrap;">
+        <button id="analyzeBtn">Analyze</button>
+        <button id="copyAuditBtn" class="ghost">Copy Audit</button>
+      </div>
+      <div class="small">Δ Price is shown in price points (e.g. 0.185).</div>
+    </div>
+
+    <div class="card">
+      <h2>Results</h2>
+      <div id="results">(click Analyze)</div>
+      <h2 style="margin-top:14px;">Audit</h2>
+      <pre id="audit">(audit will appear here)</pre>
+    </div>
+  `;
+
+  const getNum = (id) => Number(document.getElementById(id).value || 0);
+
+  const analyze = () => {
+    try {
+      errorBox.style.display = "none";
+      errorBox.textContent = "";
+
+      const b = {
+        orig_rate: getNum("orig_rate"),
+        orig_price: getNum("orig_price"),
+        orig_points: getNum("orig_points"),
+        orig_credit_pct: getNum("orig_credit_pct"),
+        loan_amount: getNum("loan_amount"),
+        term_years: getNum("term_years") || 30,
+        tax_mo: getNum("tax_mo"),
+        hazard_mo: getNum("hazard_mo"),
+        mi_mo: getNum("mi_mo"),
+        hoa_mo: getNum("hoa_mo"),
+      };
+
+      if (!b.orig_rate || !b.orig_price || !b.loan_amount) {
+        document.getElementById("results").innerHTML = `<div class="small">Enter Original Rate, Original Price, and Loan Amount.</div>`;
+        return;
+      }
+
+      const opts = [];
+      const A = { rate: getNum("A_rate"), price: getNum("A_price") };
+      const B = { rate: getNum("B_rate"), price: getNum("B_price") };
+      const C = { rate: getNum("C_rate"), price: getNum("C_price") };
+      if (A.rate && A.price) opts.push(["A - Current", A.rate, A.price]);
+      if (B.rate && B.price) opts.push(["B - Lower #1", B.rate, B.price]);
+      if (C.rate && C.price) opts.push(["C - Lower #2", C.rate, C.price]);
+
+      if (!opts.length) {
+        document.getElementById("results").innerHTML = `<div class="small">Enter at least Option A.</div>`;
+        return;
+      }
+
+      const evals = opts.map(([label, rate, price]) => evaluateOption(b, label, rate, price));
+
+      // current reference for “original → new payment”
+      const current = evals.find(e => Math.abs(e.rate - b.orig_rate) < 0.0005) || evals[0];
+
+      // best = lowest PITIA; tie-breaker lowest Δ upfront
+      const best = [...evals].sort((x,y) => (x.pitia - y.pitia) || (x.deltaUpfront$ - y.deltaUpfront$))[0];
+
+      const baseAdj = current.adj; // baseline displayed once (same concept)
+
+      let html = `
+        <div class="small">
+          Baseline: Points ${round3(baseAdj.origPts)}% ($${fmtMoney(baseAdj.origPts$)}) |
+          Credit ${round3(baseAdj.origCreditPct)}% ($${fmtMoney(baseAdj.origCredit$)})
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Option</th>
+              <th>Rate</th>
+              <th>Price</th>
+              <th>Eligible?</th>
+              <th>Δ Price (pts)</th>
+
+              <th>Orig Pts %</th>
+              <th>Orig Pts $</th>
+              <th>Orig Credit %</th>
+              <th>Orig Credit $</th>
+
+              <th>New Pts %</th>
+              <th>New Pts $</th>
+              <th>New Credit %</th>
+              <th>New Credit $</th>
+
+              <th>Δ Upfront ($)</th>
+              <th>Original → New Payment</th>
+
+              <th>Break-even (PI)</th>
+              <th>Break-even (PITIA)</th>
+            </tr>
+          </thead>
+          <tbody>
+      `;
+
+      for (const e of evals) {
+        const origPI = current.pi;
+        const origPITIA = current.pitia;
+
+        const deltaPI = e.pi - origPI;
+        const deltaPITIA = e.pitia - origPITIA;
+
+        const savingsPI = origPI - e.pi;
+        const savingsPITIA = origPITIA - e.pitia;
+
+        const bePI = breakevenMonths(e.deltaUpfront$, savingsPI);
+        const bePITIA = breakevenMonths(e.deltaUpfront$, savingsPITIA);
+
+        const eligPill = e.eligible ? `<span class="pill yes">Yes</span>` : `<span class="pill no">No</span>`;
+        const rowClass = (e === best) ? "best" : "";
+        const upfrontClass = classFromDelta(e.deltaUpfront$);
+        const payClass = classFromDelta(deltaPITIA);
+
+        html += `
+          <tr class="${rowClass}">
+            <td>${e.label}${e === best ? ` <span class="pill">Best</span>` : ""}</td>
+            <td class="nowrap">${round3(e.rate)}%</td>
+            <td class="nowrap">${round3(e.price)}</td>
+            <td>${eligPill}</td>
+            <td class="nowrap">${e.deltaPrice >= 0 ? "+" : ""}${round3(e.deltaPrice)}</td>
+
+            <td class="nowrap">${round3(baseAdj.origPts)}</td>
+            <td class="nowrap">$${fmtMoney(baseAdj.origPts$)}</td>
+            <td class="nowrap">${round3(baseAdj.origCreditPct)}</td>
+            <td class="nowrap">$${fmtMoney(baseAdj.origCredit$)}</td>
+
+            <td class="nowrap">${round3(e.adj.newPts)}</td>
+            <td class="nowrap">$${fmtMoney(e.adj.newPts$)}</td>
+            <td class="nowrap">${round3(e.adj.newCreditPct)}</td>
+            <td class="nowrap">$${fmtMoney(e.adj.newCredit$)}</td>
+
+            <td class="nowrap ${upfrontClass}"><b>${signedMoney(e.deltaUpfront$)}</b></td>
+
+            <td class="${payClass}">
+              <div><b>PI</b>: $${fmtMoney(origPI)} → $${fmtMoney(e.pi)} <span class="muted">(${signedMoney(deltaPI)})</span></div>
+              <div><b>PITIA</b>: $${fmtMoney(origPITIA)} → $${fmtMoney(e.pitia)} <span class="muted">(${signedMoney(deltaPITIA)})</span></div>
+            </td>
+
+            <td class="nowrap">${bePI}</td>
+            <td class="nowrap">${bePITIA}</td>
+          </tr>
+        `;
+      }
+
+      html += `</tbody></table>`;
+      document.getElementById("results").innerHTML = html;
+
+      // Audit
+      const lines = [];
+      lines.push("FLOAT-DOWN AUDIT");
+      lines.push("-----------------");
+      lines.push(`Baseline: Rate ${round3(b.orig_rate)}% | Price ${round3(b.orig_price)} | Loan $${fmtMoney(b.loan_amount)} | Term ${b.term_years} yrs`);
+      lines.push(`Orig Points: ${round3(baseAdj.origPts)}% ($${fmtMoney(baseAdj.origPts$)})`);
+      lines.push(`Orig Credit: ${round3(baseAdj.origCreditPct)}% ($${fmtMoney(baseAdj.origCredit$)})`);
+      lines.push(`PITIA inputs monthly: Tax $${fmtMoney(b.tax_mo)} | Hazard $${fmtMoney(b.hazard_mo)} | MI $${fmtMoney(b.mi_mo)} | HOA $${fmtMoney(b.hoa_mo)}`);
+      lines.push("");
+      lines.push(`Current reference: ${current.label} @ ${round3(current.rate)}%`);
+      lines.push(`Best: ${best.label} @ ${round3(best.rate)}%`);
+      lines.push("");
+
+      for (const e of evals) {
+        lines.push(`${e.label}: Rate ${round3(e.rate)}% | Price ${round3(e.price)} | Eligible: ${e.eligible ? "YES" : "NO"} | Δ price ${e.deltaPrice>=0?"+":""}${round3(e.deltaPrice)} pts`);
+        lines.push(`  New Points: ${round3(e.adj.newPts)}% ($${fmtMoney(e.adj.newPts$)})`);
+        lines.push(`  New Credit: ${round3(e.adj.newCreditPct)}% ($${fmtMoney(e.adj.newCredit$)})`);
+        lines.push(`  Δ Upfront: ${signedMoney(e.deltaUpfront$)} (baseline $${fmtMoney(e.baselineUpfront$)} → option $${fmtMoney(e.optionUpfront$)})`);
+        lines.push(`  Payment: PI $${fmtMoney(current.pi)} → $${fmtMoney(e.pi)} | PITIA $${fmtMoney(current.pitia)} → $${fmtMoney(e.pitia)}`);
+        lines.push("");
+      }
+
+      document.getElementById("audit").textContent = lines.join("\n");
+    } catch (err) {
+      showError("Analyze error: " + (err && err.message ? err.message : String(err)));
+    }
+  };
+
+  document.getElementById("analyzeBtn").addEventListener("click", analyze);
+
+  document.getElementById("copyAuditBtn").addEventListener("click", async () => {
+    try {
+      const txt = document.getElementById("audit").textContent || "";
+      if (!txt.trim()) return;
+      await navigator.clipboard.writeText(txt);
+      alert("Audit copied.");
+    } catch {
+      alert("Clipboard blocked. Click inside the audit box and press Ctrl+C.");
+    }
+  });
+
+})();
+</script>
+</body>
+</html>
